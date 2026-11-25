@@ -285,31 +285,51 @@ def search_supabase_chemical_bm25(keyword: str):
     if not clean_kw:
         return pd.DataFrame()
     
+    no_space_kw = clean_kw.replace(" ", "")
     engine = get_supabase_engine()
     
-    # BM25 핵심 원리 적용:
-    # 1. ts_rank_cd(..., 32): 문서 길이 정규화(문서가 짧을수록 가산점) + 단어 빈도(TF) + 역문서 빈도(IDF)
-    # 2. similarity(): 화학물질명 특유의 띄어쓰기 없는 복합어 및 오타 보정
-    # 3. CAS 번호 및 물질명 완전 일치 시 최상단 노출 가중치 부여
+    # 오타 허용 및 BM25 하이브리드 랭킹 쿼리
+    # - WHERE 절에 similarity() > 0.25 조건을 추가하여 오타가 있어도 검색 결과에 포함
+    # - word_similarity(): 긴 화학물질명 안에 검색어와 비슷한 단어 덩어리가 있을 때 높은 점수 부여
     query = """
         WITH scored_matches AS (
             SELECT 
                 cas_no,
                 MAX(
-                    -- 1) 완전 일치 보너스 (최우선)
-                    CASE WHEN LOWER(chemical_name) = LOWER(:exact_kw) OR cas_no = :exact_kw THEN 10.0 ELSE 0.0 END +
-                    -- 2) 접두어 일치 보너스
-                    CASE WHEN chemical_name ILIKE :prefix_kw OR cas_no ILIKE :prefix_kw THEN 3.0 ELSE 0.0 END +
-                    -- 3) PostgreSQL FTS 문서 길이 정규화 랭킹 (BM25의 TF-IDF 및 길이 보정 역할)
+                    -- 1) 완전 일치 보너스 (공백 무시)
+                    CASE 
+                        WHEN REPLACE(LOWER(chemical_name), ' ', '') = LOWER(:no_space_kw) 
+                             OR cas_no = :exact_kw 
+                        THEN 12.0 ELSE 0.0 
+                    END +
+                    -- 2) 부분 문자열 포함 보너스 (오타 없는 일반 검색 시 상위 노출 보장)
+                    CASE 
+                        WHEN REPLACE(chemical_name, ' ', '') ILIKE :no_space_like 
+                             OR cas_no ILIKE :like_kw 
+                        THEN 4.0 ELSE 0.0 
+                    END +
+                    -- 3) BM25 핵심: 문서 길이 정규화 랭킹 (TF-IDF)
                     ts_rank_cd(to_tsvector('simple', chemical_name), plainto_tsquery('simple', :exact_kw), 32) * 5.0 +
-                    -- 4) Trigram 문자열 유사도 (복합 화학물질명 부분 일치 점수)
-                    similarity(chemical_name, :exact_kw) * 2.0
+                    -- 4) 전체 문자열 Trigram 유사도 (오타 교정 핵심 점수)
+                    similarity(REPLACE(LOWER(chemical_name), ' ', ''), LOWER(:no_space_kw)) * 6.0 +
+                    -- 5) 부분 단어 Trigram 유사도 (긴 복합명 속 오타 단어 포착)
+                    word_similarity(LOWER(:no_space_kw), REPLACE(LOWER(chemical_name), ' ', '')) * 3.0
                 ) AS relevance_score
             FROM public.chemical_names
             WHERE 
+                -- 기본 포함 검색 (공백 포함/무시)
                 chemical_name ILIKE :like_kw 
                 OR cas_no ILIKE :like_kw
+                OR REPLACE(chemical_name, ' ', '') ILIKE :no_space_like
                 OR to_tsvector('simple', chemical_name) @@ plainto_tsquery('simple', :exact_kw)
+                -- [확장] 오타 허용 조건: 3글자 이상 입력 시 유사도 0.25 이상이면 오타라도 검색 허용
+                OR (
+                    LENGTH(:no_space_kw) >= 3 
+                    AND (
+                        similarity(REPLACE(LOWER(chemical_name), ' ', ''), LOWER(:no_space_kw)) >= 0.25
+                        OR word_similarity(LOWER(:no_space_kw), REPLACE(LOWER(chemical_name), ' ', '')) >= 0.45
+                    )
+                )
             GROUP BY cas_no
         )
         SELECT 
@@ -329,8 +349,9 @@ def search_supabase_chemical_bm25(keyword: str):
     
     params = {
         "exact_kw": clean_kw,
-        "prefix_kw": f"{clean_kw}%",
-        "like_kw": f"%{clean_kw}%"
+        "like_kw": f"%{clean_kw}%",
+        "no_space_kw": no_space_kw,
+        "no_space_like": f"%{no_space_kw}%"
     }
     
     with engine.connect() as conn:
